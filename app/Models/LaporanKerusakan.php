@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Services\CloudinaryService;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -9,6 +10,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\Response;
+use Throwable;
 
 class LaporanKerusakan extends Model
 {
@@ -18,7 +20,6 @@ class LaporanKerusakan extends Model
     public const STATUS_DIPROSES = 'diproses';
     public const STATUS_SELESAI = 'selesai';
 
-    /** Urutan ini juga menjadi aturan "status hanya bisa maju". */
     public const STATUS = [
         self::STATUS_DIKIRIM => 'Dikirim',
         self::STATUS_DIPROSES => 'Diproses',
@@ -27,11 +28,10 @@ class LaporanKerusakan extends Model
 
     protected $table = 'laporan_kerusakan';
 
-    // Kolom lain (penghuni_id, pemilik_id, kamar_id, snapshot, tgl_lapor, status, catatan_pemilik,
-    // tgl_selesai) sengaja tidak fillable: diisi controller, tidak pernah dari input form penghuni.
     protected $fillable = [
         'deskripsi',
         'foto',
+        'foto_public_id',
     ];
 
     protected function casts(): array
@@ -42,15 +42,24 @@ class LaporanKerusakan extends Model
         ];
     }
 
-    /** Hapus file foto saat laporan dihapus lewat Eloquent (menunggu commit kalau ada transaksi). */
     protected static function booted(): void
     {
         static::deleted(function (LaporanKerusakan $laporan) {
-            if ($laporan->foto) {
-                $path = $laporan->foto;
+            $path = $laporan->foto;
+            $publicId = $laporan->foto_public_id;
 
-                DB::afterCommit(fn () => Storage::disk('local')->delete($path));
-            }
+            DB::afterCommit(function () use ($path, $publicId) {
+                try {
+                    if ($publicId) {
+                        app(CloudinaryService::class)
+                            ->deleteImage($publicId, 'authenticated');
+                    } elseif ($path) {
+                        Storage::disk('local')->delete($path);
+                    }
+                } catch (Throwable $e) {
+                    report($e);
+                }
+            });
         });
     }
 
@@ -69,33 +78,28 @@ class LaporanKerusakan extends Model
         return $this->belongsTo(Kamar::class, 'kamar_id');
     }
 
-    /* ---------------------------------------------------------------- scope */
-
     public function scopeAktif($query)
     {
-        return $query->whereIn('status', [self::STATUS_DIKIRIM, self::STATUS_DIPROSES]);
+        return $query->whereIn('status', [
+            self::STATUS_DIKIRIM,
+            self::STATUS_DIPROSES,
+        ]);
     }
 
-    /**
-     * Laporan yang masih bisa ditangani pemilik ini: milik pemilik tersebut dan penghuninya
-     * masih ada. Dipakai bersama oleh daftar dan angka di dashboard supaya selalu sama.
-     */
     public function scopeKelolaOleh($query, int $pemilikId)
     {
-        return $query->where('pemilik_id', $pemilikId)->whereNotNull('penghuni_id');
+        return $query->where('pemilik_id', $pemilikId)
+            ->whereNotNull('penghuni_id');
     }
 
-    /** Laporan milik pemilik saat ini + arsip pemilik sebelumnya (pemilik_id null). */
     public function scopeTampilUntukPemilik($query, int $pemilikId)
     {
         return $query->where(function ($q) use ($pemilikId) {
-            $q->where('pemilik_id', $pemilikId)->orWhereNull('pemilik_id');
+            $q->where('pemilik_id', $pemilikId)
+                ->orWhereNull('pemilik_id');
         });
     }
 
-    /* ----------------------------------------------------------- kepemilikan */
-
-    /** Arsip hanya-baca: akun penghuni ATAU akun pemilik laporan ini sudah dihapus. */
     public function isArsip(): bool
     {
         return $this->penghuni_id === null || $this->pemilik_id === null;
@@ -103,10 +107,10 @@ class LaporanKerusakan extends Model
 
     public function isMilikPemilik(int $pemilikId): bool
     {
-        return $this->pemilik_id !== null && (int) $this->pemilik_id === $pemilikId;
+        return $this->pemilik_id !== null
+            && (int) $this->pemilik_id === $pemilikId;
     }
 
-    /** Boleh diubah statusnya: bukan arsip dan milik pemilik tersebut. */
     public function dapatDikelolaOleh(int $pemilikId): bool
     {
         return ! $this->isArsip() && $this->isMilikPemilik($pemilikId);
@@ -114,10 +118,9 @@ class LaporanKerusakan extends Model
 
     public function isMilikPenghuni(int $penghuniId): bool
     {
-        return $this->penghuni_id !== null && (int) $this->penghuni_id === $penghuniId;
+        return $this->penghuni_id !== null
+            && (int) $this->penghuni_id === $penghuniId;
     }
-
-    /* ---------------------------------------------------------------- status */
 
     public function isDikirim(): bool
     {
@@ -134,7 +137,6 @@ class LaporanKerusakan extends Model
         return $this->status === self::STATUS_SELESAI;
     }
 
-    /** Penghuni hanya boleh mengubah/menghapus selama laporan belum disentuh pemilik. */
     public function bisaDiubahPenghuni(): bool
     {
         return $this->isDikirim();
@@ -147,12 +149,12 @@ class LaporanKerusakan extends Model
         return $nomor === false ? -1 : $nomor;
     }
 
-    /** Status yang boleh dipilih pemilik dari status sekarang: tetap atau maju, tidak pernah mundur. */
     public function statusTujuan(): array
     {
         return array_filter(
             self::STATUS,
-            fn (string $label, string $kode) => self::urutan($kode) >= self::urutan($this->status),
+            fn (string $label, string $kode) =>
+                self::urutan($kode) >= self::urutan($this->status),
             ARRAY_FILTER_USE_BOTH
         );
     }
@@ -167,7 +169,6 @@ class LaporanKerusakan extends Model
         return self::STATUS[$this->status] ?? $this->status;
     }
 
-    /** Warna badge: success = hijau, warning = oranye, neutral = abu. */
     public function getStatusToneAttribute(): string
     {
         return match ($this->status) {
@@ -177,9 +178,6 @@ class LaporanKerusakan extends Model
         };
     }
 
-    /* ----------------------------------------------------------- tampilan */
-
-    /** Sumber utama adalah snapshot; relasi hanya cadangan kalau snapshot kosong. */
     public function getNamaPenghuniTampilAttribute(): string
     {
         return $this->nama_penghuni ?: ($this->penghuni?->name ?? '-');
@@ -197,26 +195,47 @@ class LaporanKerusakan extends Model
 
     public function getTglSelesaiLabelAttribute(): ?string
     {
-        return $this->tgl_selesai ? Tagihan::formatTanggal($this->tgl_selesai) : null;
+        return $this->tgl_selesai
+            ? Tagihan::formatTanggal($this->tgl_selesai)
+            : null;
     }
-
-    /* ------------------------------------------------------------------ foto */
 
     public function getNamaFileFotoAttribute(): string
     {
         $ext = pathinfo((string) $this->foto, PATHINFO_EXTENSION);
 
-        return 'laporan-'.Str::slug($this->nomor_kamar_tampil).'-'.$this->id.'.'.$ext;
+        return 'laporan-' . Str::slug($this->nomor_kamar_tampil)
+            . '-' . $this->id . '.' . $ext;
     }
 
-    /** Kirim file foto dari disk privat. Otorisasi dilakukan di controller sebelum memanggil ini. */
+    /** Otorisasi dilakukan controller sebelum method ini dipanggil. */
     public function responFoto(): Response
     {
         abort_if(! $this->foto, 404, 'Laporan ini tidak memiliki foto.');
 
+        if ($this->foto_public_id) {
+            $format = strtolower(
+                pathinfo($this->foto, PATHINFO_EXTENSION)
+            );
+
+            abort_if(! $format, 404, 'Format foto tidak valid.');
+
+            $url = app(CloudinaryService::class)->privateImageUrl(
+                $this->foto_public_id,
+                $format,
+                now()->addMinutes(5)->timestamp
+            );
+
+            return redirect()->away($url);
+        }
+
         $disk = Storage::disk('local');
 
-        abort_unless($disk->exists($this->foto), 404, 'File foto tidak ditemukan.');
+        abort_unless(
+            $disk->exists($this->foto),
+            404,
+            'File foto tidak ditemukan.'
+        );
 
         return $disk->response($this->foto, $this->nama_file_foto);
     }

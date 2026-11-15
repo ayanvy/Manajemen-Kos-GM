@@ -11,9 +11,9 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
 use Illuminate\View\View;
-use RuntimeException;
 use Symfony\Component\HttpFoundation\Response;
 use Throwable;
+use App\Services\CloudinaryService;
 
 /** Penghuni membayar tagihan, memantau status, dan melihat riwayat pembayaran miliknya sendiri. */
 class PembayaranController extends Controller
@@ -45,8 +45,10 @@ class PembayaranController extends Controller
         ]);
     }
 
-    public function store(Request $request): RedirectResponse
-    {
+    public function store(
+        Request $request,
+        CloudinaryService $cloudinary
+    ): RedirectResponse {
         $data = $request->validate([
             'tagihan_id' => ['required', 'integer'],
             'metode' => ['required', Rule::in(array_keys(Pembayaran::METODE))],
@@ -61,14 +63,16 @@ class PembayaranController extends Controller
         ]);
 
         $userId = $request->user()->id;
-
-        // Path file yang sudah ditulis ke disk. Diisi di dalam transaksi, dibersihkan di catch
-        // kalau transaksi gagal (termasuk saat commit), sehingga tidak ada file yatim.
-        $path = null;
+        $publicIdBaru = null;
 
         try {
-            return DB::transaction(function () use ($request, $data, $userId, &$path) {
-                // Kunci baris tagihan supaya dua kiriman bersamaan tidak lolos dua-duanya.
+            return DB::transaction(function () use (
+                $request,
+                $data,
+                $userId,
+                $cloudinary,
+                &$publicIdBaru
+            ) {
                 $tagihan = Tagihan::where('id', $data['tagihan_id'])
                     ->where('penghuni_id', $userId)
                     ->lockForUpdate()
@@ -77,28 +81,32 @@ class PembayaranController extends Controller
                 abort_if($tagihan === null, 404);
 
                 if ($tagihan->isLunas()) {
-                    return back()->withInput()->withErrors(['tagihan_id' => 'Tagihan ini sudah lunas.']);
+                    return back()->withInput()
+                        ->withErrors(['tagihan_id' => 'Tagihan ini sudah lunas.']);
                 }
 
                 if ($tagihan->sedangDiverifikasi()) {
-                    return back()->withInput()->withErrors(['tagihan_id' => 'Pembayaran untuk tagihan ini sedang menunggu verifikasi.']);
+                    return back()->withInput()
+                        ->withErrors(['tagihan_id' => 'Pembayaran untuk tagihan ini sedang menunggu verifikasi.']);
                 }
 
-                $disimpan = $request->file('bukti')->store('pembayaran/bukti', 'local');
+                $result = $cloudinary->uploadImage(
+                    $request->file('bukti')->getRealPath(),
+                    'sistem-informasi-kos/pembayaran',
+                    'authenticated'
+                );
 
-                if ($disimpan === false) {
-                    throw new RuntimeException('Gagal menyimpan file bukti pembayaran.');
-                }
-
-                $path = $disimpan;
+                $publicIdBaru = $result['public_id'];
 
                 $pembayaran = new Pembayaran([
                     'tagihan_id' => $tagihan->id,
                     'metode' => $data['metode'],
                     'tgl_bayar' => now()->toDateString(),
-                    'jumlah' => $tagihan->jumlah, // selalu ikut tagihan, bukan dari input
-                    'bukti_pembayaran' => $path,
+                    'jumlah' => $tagihan->jumlah,
+                    'bukti_pembayaran' => $result['secure_url'],
+                    'bukti_public_id' => $publicIdBaru,
                 ]);
+
                 $pembayaran->status = Pembayaran::STATUS_MENUNGGU;
                 $pembayaran->save();
 
@@ -106,12 +114,11 @@ class PembayaranController extends Controller
                     ->with('status', 'pembayaran-sent');
             });
         } catch (Throwable $e) {
-            $this->bersihkanBuktiYatim($path);
+            $this->bersihkanBuktiYatim($publicIdBaru, $cloudinary);
 
             throw $e;
         }
     }
-
     /** Status terbaru pembayaran untuk tiap tagihan. */
     public function status(Request $request): View
     {
@@ -181,25 +188,20 @@ class PembayaranController extends Controller
         );
     }
 
-    /**
-     * Hapus file bukti yang tidak punya baris pembayaran. Dipanggil saat transaksi gagal.
-     *
-     * Kalau baris dengan path ini ternyata sudah tersimpan (mis. koneksi putus tepat setelah
-     * commit berhasil), file dibiarkan. Kalau pengecekan itu sendiri gagal, file juga dibiarkan:
-     * lebih aman meninggalkan satu file yatim daripada menghapus bukti yang sudah tercatat.
-     */
-    private function bersihkanBuktiYatim(?string $path): void
-    {
-        if ($path === null) {
+    private function bersihkanBuktiYatim(
+        ?string $publicId,
+        CloudinaryService $cloudinary
+    ): void {
+        if ($publicId === null) {
             return;
         }
 
         try {
-            if (Pembayaran::where('bukti_pembayaran', $path)->exists()) {
+            if (Pembayaran::where('bukti_public_id', $publicId)->exists()) {
                 return;
             }
 
-            Storage::disk('local')->delete($path);
+            $cloudinary->deleteImage($publicId, 'authenticated');
         } catch (Throwable $e) {
             report($e);
         }

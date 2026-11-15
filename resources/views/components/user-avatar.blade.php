@@ -4,7 +4,9 @@
 
 @if ($user->profile_photo_path)
     <img
-        src="{{ asset('storage/' . $user->profile_photo_path) }}"
+        src="{{ str_starts_with($user->profile_photo_path, 'http')
+        ? $user->profile_photo_path
+        : asset('storage/' . $user->profile_photo_path) }}"
         alt="Foto profil {{ $user->name }}"
         {{ $attributes->merge(['class' => 'kos-avatar kos-avatar-' . $size]) }}
     />

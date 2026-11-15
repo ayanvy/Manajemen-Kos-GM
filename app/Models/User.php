@@ -14,7 +14,7 @@ use Illuminate\Notifications\Notifiable;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 
-#[Fillable(['name', 'email', 'password', 'phone', 'profile_photo_path',])]
+#[Fillable(['name', 'email', 'password', 'phone', 'profile_photo_path', 'profile_photo_public_id',])]
 #[Hidden(['password', 'remember_token'])]
 class User extends Authenticatable
 {
@@ -70,8 +70,18 @@ class User extends Authenticatable
                 'penghuni_id' => null,
             ]));
 
-        // Hapus foto profil penghuni jika tersedia.
-        if ($user->profile_photo_path) {
+        // Hapus foto profil dari Cloudinary jika tersedia.
+        if ($user->profile_photo_public_id) {
+            try {
+                app(\App\Services\CloudinaryService::class)
+                    ->deleteImage($user->profile_photo_public_id);
+            } catch (\Throwable $e) {
+                report($e);
+            }
+        } elseif (
+            $user->profile_photo_path &&
+            ! str_starts_with($user->profile_photo_path, 'http')
+        ) {
             Storage::disk('public')->delete($user->profile_photo_path);
         }
 

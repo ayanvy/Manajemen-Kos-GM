@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\KamarRequest;
 use App\Models\Kamar;
 use App\Models\User;
+use App\Services\CloudinaryService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
@@ -30,14 +31,21 @@ class KamarController extends Controller
         return view('pemilik.kamar.create', compact('penghuniOptions'));
     }
 
-    public function store(KamarRequest $request): RedirectResponse
-    {
-        // Foto ditangani terpisah; bukan kolom yang boleh diisi massal dari input.
+    public function store(
+        KamarRequest $request,
+        CloudinaryService $cloudinary
+    ): RedirectResponse {
         $kamar = new Kamar($request->safe()->except(['foto', 'hapus_foto']));
         $kamar->pemilik_id = $request->user()->id;
 
         if ($request->hasFile('foto')) {
-            $kamar->foto = $request->file('foto')->store('kamar-photos', 'public');
+            $result = $cloudinary->uploadImage(
+                $request->file('foto')->getRealPath(),
+                'sistem-informasi-kos/kamar'
+            );
+
+            $kamar->foto = $result['secure_url'];
+            $kamar->foto_public_id = $result['public_id'];
         }
 
         $kamar->save();
@@ -55,33 +63,55 @@ class KamarController extends Controller
         return view('pemilik.kamar.edit', compact('kamar', 'penghuniOptions'));
     }
 
-    public function update(KamarRequest $request, Kamar $kamar): RedirectResponse
-    {
+    public function update(
+        KamarRequest $request,
+        Kamar $kamar,
+        CloudinaryService $cloudinary
+    ): RedirectResponse {
         $this->pastikanMilik($request, $kamar);
 
         $fotoLama = $kamar->foto;
+        $publicIdLama = $kamar->foto_public_id;
 
         $kamar->fill($request->safe()->except(['foto', 'hapus_foto']));
 
         if ($request->hasFile('foto')) {
-            $kamar->foto = $request->file('foto')->store('kamar-photos', 'public');
+            $result = $cloudinary->uploadImage(
+                $request->file('foto')->getRealPath(),
+                'sistem-informasi-kos/kamar'
+            );
+
+            $kamar->foto = $result['secure_url'];
+            $kamar->foto_public_id = $result['public_id'];
         } elseif ($request->boolean('hapus_foto')) {
             $kamar->foto = null;
+            $kamar->foto_public_id = null;
         }
 
         $kamar->save();
 
-        // File lama dihapus setelah data tersimpan, supaya tidak hilang kalau penyimpanan gagal.
-        if ($fotoLama && $fotoLama !== $kamar->foto) {
-            Storage::disk('public')->delete($fotoLama);
+        // Hapus foto lama setelah data kamar berhasil disimpan.
+        if ($fotoLama !== $kamar->foto) {
+            if ($publicIdLama) {
+                try {
+                    $cloudinary->deleteImage($publicIdLama);
+                } catch (\Throwable $e) {
+                    report($e);
+                }
+            } elseif ($fotoLama && ! str_starts_with($fotoLama, 'http')) {
+                Storage::disk('public')->delete($fotoLama);
+            }
         }
 
         return redirect()->route('pemilik.kamar.index')
             ->with('status', 'kamar-updated');
     }
 
-    public function destroy(Request $request, Kamar $kamar): RedirectResponse
-    {
+    public function destroy(
+        Request $request,
+        Kamar $kamar,
+        CloudinaryService $cloudinary
+    ): RedirectResponse {
         $this->pastikanMilik($request, $kamar);
 
         if ($kamar->isTerisi()) {
@@ -89,7 +119,17 @@ class KamarController extends Controller
                 ->with('status', 'kamar-terisi');
         }
 
+        $publicId = $kamar->foto_public_id;
+
         $kamar->delete();
+
+        if ($publicId) {
+            try {
+                $cloudinary->deleteImage($publicId);
+            } catch (\Throwable $e) {
+                report($e);
+            }
+        }
 
         return redirect()->route('pemilik.kamar.index')
             ->with('status', 'kamar-deleted');

@@ -30,16 +30,22 @@ class Kamar extends Model
         'status',
     ];
 
-    /** Status selalu mengikuti penghuni: ada penghuni = terisi, tidak ada = tersedia. */
     protected static function booted(): void
     {
         static::saving(function (Kamar $kamar) {
-            $kamar->status = $kamar->penghuni_id ? self::STATUS_TERISI : self::STATUS_TERSEDIA;
+            $kamar->status = $kamar->penghuni_id
+                ? self::STATUS_TERISI
+                : self::STATUS_TERSEDIA;
         });
 
-        // Hapus file foto dari disk saat kamar dihapus.
         static::deleted(function (Kamar $kamar) {
-            if ($kamar->foto) {
+            // Foto Cloudinary dihapus melalui controller.
+            // Foto lokal lama tetap dihapus di sini.
+            if (
+                $kamar->foto &&
+                ! $kamar->foto_public_id &&
+                ! str_starts_with($kamar->foto, 'http')
+            ) {
                 Storage::disk('public')->delete($kamar->foto);
             }
         });
@@ -62,12 +68,15 @@ class Kamar extends Model
         return $this->belongsTo(User::class, 'penghuni_id');
     }
 
-    /** URL foto kamar; kalau pemilik belum mengunggah foto, pakai gambar bawaan. */
     public function getFotoUrlAttribute(): string
     {
-        return $this->foto
-            ? asset('storage/'.$this->foto)
-            : asset('images/kos-hero.jpg');
+        if (! $this->foto) {
+            return asset('images/kos-hero.jpg');
+        }
+
+        return str_starts_with($this->foto, 'http')
+            ? $this->foto
+            : asset('storage/'.$this->foto);
     }
 
     public function isTerisi(): bool
@@ -80,9 +89,10 @@ class Kamar extends Model
         return 'Rp '.number_format((float) $this->harga, 0, ',', '.');
     }
 
-    /** Fasilitas disimpan sebagai teks dipisah koma, ini mengubahnya jadi array rapi. */
     public function getDaftarFasilitasAttribute(): array
     {
-        return array_values(array_filter(array_map('trim', explode(',', (string) $this->fasilitas))));
+        return array_values(array_filter(
+            array_map('trim', explode(',', (string) $this->fasilitas))
+        ));
     }
 }

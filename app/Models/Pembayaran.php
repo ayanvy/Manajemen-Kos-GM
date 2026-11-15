@@ -2,12 +2,15 @@
 
 namespace App\Models;
 
+use App\Services\CloudinaryService;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\Response;
+use Throwable;
 
 class Pembayaran extends Model
 {
@@ -30,14 +33,13 @@ class Pembayaran extends Model
 
     protected $table = 'pembayaran';
 
-    // Kolom verifikasi (status, diverifikasi_oleh, tgl_verifikasi, alasan_penolakan) sengaja
-    // tidak fillable: hanya diisi controller pemilik, tidak pernah dari input form penghuni.
     protected $fillable = [
         'tagihan_id',
         'metode',
         'tgl_bayar',
         'jumlah',
         'bukti_pembayaran',
+        'bukti_public_id',
     ];
 
     protected function casts(): array
@@ -49,11 +51,24 @@ class Pembayaran extends Model
         ];
     }
 
-    /** Hapus file bukti saat data pembayaran dihapus lewat Eloquent. */
     protected static function booted(): void
     {
         static::deleted(function (Pembayaran $pembayaran) {
-            Storage::disk('local')->delete($pembayaran->bukti_pembayaran);
+            $path = $pembayaran->bukti_pembayaran;
+            $publicId = $pembayaran->bukti_public_id;
+
+            DB::afterCommit(function () use ($path, $publicId) {
+                try {
+                    if ($publicId) {
+                        app(CloudinaryService::class)
+                            ->deleteImage($publicId, 'authenticated');
+                    } elseif ($path) {
+                        Storage::disk('local')->delete($path);
+                    }
+                } catch (Throwable $e) {
+                    report($e);
+                }
+            });
         });
     }
 
@@ -67,7 +82,6 @@ class Pembayaran extends Model
         return $this->belongsTo(User::class, 'diverifikasi_oleh');
     }
 
-    /** Pembayaran untuk tagihan milik pemilik ini (arsip tanpa pemilik tidak ikut). */
     public function scopeUntukPemilik($query, int $pemilikId)
     {
         return $query->whereHas('tagihan', fn ($q) => $q->where('pemilik_id', $pemilikId));
@@ -78,10 +92,6 @@ class Pembayaran extends Model
         return $query->where('status', self::STATUS_MENUNGGU);
     }
 
-    /**
-     * Pembayaran yang perlu diverifikasi pemilik ini. Dipakai bersama oleh halaman verifikasi
-     * dan angka di dashboard supaya keduanya selalu sama.
-     */
     public function scopePerluDiverifikasi($query, int $pemilikId)
     {
         return $query->menunggu()
@@ -109,7 +119,6 @@ class Pembayaran extends Model
         return self::STATUS[$this->status] ?? $this->status;
     }
 
-    /** Warna badge: success = hijau, warning = oranye, danger = merah. */
     public function getStatusToneAttribute(): string
     {
         return match ($this->status) {
@@ -136,17 +145,41 @@ class Pembayaran extends Model
 
     public function getNamaFileBuktiAttribute(): string
     {
-        $ext = pathinfo($this->bukti_pembayaran, PATHINFO_EXTENSION);
+        $ext = pathinfo((string) $this->bukti_pembayaran, PATHINFO_EXTENSION);
 
         return 'bukti-'.Str::slug($this->tagihan?->periode ?? 'pembayaran').'-'.$this->id.'.'.$ext;
     }
 
-    /** Kirim file bukti dari disk privat. Otorisasi dilakukan di controller sebelum memanggil ini. */
+    /** Otorisasi dilakukan controller sebelum method ini dipanggil. */
     public function responBukti(bool $unduh = false): Response
     {
+        abort_if(! $this->bukti_pembayaran, 404, 'Pembayaran ini tidak memiliki bukti.');
+
+        if ($this->bukti_public_id) {
+            $format = strtolower(
+                pathinfo($this->bukti_pembayaran, PATHINFO_EXTENSION)
+            );
+
+            abort_if(! in_array($format, ['jpg', 'jpeg', 'png', 'pdf'], true), 404);
+
+            $url = app(CloudinaryService::class)->privateImageUrl(
+                $this->bukti_public_id,
+                $format,
+                now()->addMinutes(5)->timestamp,
+                $unduh,
+                $unduh ? $this->nama_file_bukti : null
+            );
+
+            return redirect()->away($url);
+        }
+
         $disk = Storage::disk('local');
 
-        abort_unless($disk->exists($this->bukti_pembayaran), 404, 'File bukti tidak ditemukan.');
+        abort_unless(
+            $disk->exists($this->bukti_pembayaran),
+            404,
+            'File bukti tidak ditemukan.'
+        );
 
         return $unduh
             ? $disk->download($this->bukti_pembayaran, $this->nama_file_bukti)

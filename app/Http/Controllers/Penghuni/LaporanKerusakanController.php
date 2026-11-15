@@ -10,9 +10,9 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\View\View;
-use RuntimeException;
 use Symfony\Component\HttpFoundation\Response;
 use Throwable;
+use App\Services\CloudinaryService;
 
 /** Penghuni membuat, mengubah, menghapus, dan memantau laporan kerusakan miliknya sendiri. */
 class LaporanKerusakanController extends Controller
@@ -41,8 +41,10 @@ class LaporanKerusakanController extends Controller
         return view('penghuni.laporan.create', compact('kamar'));
     }
 
-    public function store(LaporanKerusakanRequest $request): RedirectResponse
-    {
+    public function store(
+        LaporanKerusakanRequest $request,
+        CloudinaryService $cloudinary
+    ): RedirectResponse {
         $user = $request->user();
         $kamar = $user->kamar;
 
@@ -51,24 +53,25 @@ class LaporanKerusakanController extends Controller
                 ->with('error', 'Anda belum menempati kamar, jadi belum bisa membuat laporan kerusakan.');
         }
 
-        // Path file yang sudah ditulis ke disk; dibersihkan di catch kalau penyimpanan gagal.
-        $path = null;
+        $publicIdBaru = null;
 
         try {
-            $laporan = new LaporanKerusakan(['deskripsi' => $request->validated('deskripsi')]);
+            $laporan = new LaporanKerusakan([
+                'deskripsi' => $request->validated('deskripsi'),
+            ]);
 
             if ($request->hasFile('foto')) {
-                $disimpan = $request->file('foto')->store('laporan/foto', 'local');
+                $result = $cloudinary->uploadImage(
+                    $request->file('foto')->getRealPath(),
+                    'sistem-informasi-kos/laporan',
+                    'authenticated'
+                );
 
-                if ($disimpan === false) {
-                    throw new RuntimeException('Gagal menyimpan file foto laporan.');
-                }
-
-                $path = $disimpan;
-                $laporan->foto = $path;
+                $publicIdBaru = $result['public_id'];
+                $laporan->foto = $result['secure_url'];
+                $laporan->foto_public_id = $publicIdBaru;
             }
 
-            // Penghuni, pemilik, dan kamar selalu diambil dari data kamar penghuni, bukan dari input.
             $laporan->penghuni_id = $user->id;
             $laporan->pemilik_id = $kamar->pemilik_id;
             $laporan->kamar_id = $kamar->id;
@@ -78,8 +81,7 @@ class LaporanKerusakanController extends Controller
             $laporan->status = LaporanKerusakan::STATUS_DIKIRIM;
             $laporan->save();
         } catch (Throwable $e) {
-            $this->bersihkanFotoYatim($path);
-
+            $this->bersihkanFotoYatim(null, $publicIdBaru, $cloudinary);
             throw $e;
         }
 
@@ -116,16 +118,24 @@ class LaporanKerusakanController extends Controller
         return view('penghuni.laporan.edit', compact('laporan'));
     }
 
-    public function update(LaporanKerusakanRequest $request, LaporanKerusakan $laporan): RedirectResponse
-    {
+    public function update(
+        LaporanKerusakanRequest $request,
+        LaporanKerusakan $laporan,
+        CloudinaryService $cloudinary
+    ): RedirectResponse {
         $this->pastikanMilik($request, $laporan);
 
         $userId = $request->user()->id;
-        $pathBaru = null;
+        $publicIdBaru = null;
 
         try {
-            return DB::transaction(function () use ($request, $laporan, $userId, &$pathBaru) {
-                // Kunci baris supaya tidak bentrok dengan pemilik yang sedang mengubah status.
+            return DB::transaction(function () use (
+                $request,
+                $laporan,
+                $userId,
+                $cloudinary,
+                &$publicIdBaru
+            ) {
                 $terkunci = LaporanKerusakan::whereKey($laporan->getKey())
                     ->where('penghuni_id', $userId)
                     ->lockForUpdate()
@@ -133,42 +143,64 @@ class LaporanKerusakanController extends Controller
 
                 abort_if($terkunci === null, 404);
 
-                // Status dicek ulang setelah terkunci: pemilik mungkin sudah memprosesnya.
                 if (! $terkunci->bisaDiubahPenghuni()) {
                     return $this->tidakBisaDiubah($terkunci);
                 }
 
                 $terkunci->deskripsi = $request->validated('deskripsi');
+
                 $pathLama = null;
+                $publicIdLama = null;
 
                 if ($request->hasFile('foto')) {
-                    $disimpan = $request->file('foto')->store('laporan/foto', 'local');
+                    $result = $cloudinary->uploadImage(
+                        $request->file('foto')->getRealPath(),
+                        'sistem-informasi-kos/laporan',
+                        'authenticated'
+                    );
 
-                    if ($disimpan === false) {
-                        throw new RuntimeException('Gagal menyimpan file foto laporan.');
-                    }
-
-                    $pathBaru = $disimpan;
+                    $publicIdBaru = $result['public_id'];
                     $pathLama = $terkunci->foto;
-                    $terkunci->foto = $pathBaru;
+                    $publicIdLama = $terkunci->foto_public_id;
+
+                    $terkunci->foto = $result['secure_url'];
+                    $terkunci->foto_public_id = $publicIdBaru;
                 } elseif ($request->boolean('hapus_foto') && $terkunci->foto) {
                     $pathLama = $terkunci->foto;
+                    $publicIdLama = $terkunci->foto_public_id;
+
                     $terkunci->foto = null;
+                    $terkunci->foto_public_id = null;
                 }
 
                 $terkunci->save();
 
-                // File lama baru dihapus setelah commit, supaya rollback tidak menghilangkan foto.
                 if ($pathLama) {
-                    DB::afterCommit(fn () => Storage::disk('local')->delete($pathLama));
+                    DB::afterCommit(function () use (
+                        $pathLama,
+                        $publicIdLama,
+                        $cloudinary
+                    ) {
+                        try {
+                            if ($publicIdLama) {
+                                $cloudinary->deleteImage(
+                                    $publicIdLama,
+                                    'authenticated'
+                                );
+                            } elseif (! str_starts_with($pathLama, 'http')) {
+                                Storage::disk('local')->delete($pathLama);
+                            }
+                        } catch (Throwable $e) {
+                            report($e);
+                        }
+                    });
                 }
 
                 return redirect()->route('penghuni.laporan.show', $terkunci)
                     ->with('status', 'laporan-updated');
             });
         } catch (Throwable $e) {
-            $this->bersihkanFotoYatim($pathBaru);
-
+            $this->bersihkanFotoYatim(null, $publicIdBaru, $cloudinary);
             throw $e;
         }
     }
@@ -226,13 +258,26 @@ class LaporanKerusakanController extends Controller
      * Kalau baris dengan path ini ternyata sudah tersimpan, atau pengecekannya gagal,
      * file dibiarkan: lebih aman meninggalkan satu file yatim daripada menghapus foto yang tercatat.
      */
-    private function bersihkanFotoYatim(?string $path): void
-    {
-        if ($path === null) {
-            return;
-        }
-
+    private function bersihkanFotoYatim(
+        ?string $path,
+        ?string $publicId = null,
+        ?CloudinaryService $cloudinary = null
+    ): void {
         try {
+            if ($publicId !== null) {
+                if (LaporanKerusakan::where('foto_public_id', $publicId)->exists()) {
+                    return;
+                }
+
+                $cloudinary?->deleteImage($publicId, 'authenticated');
+
+                return;
+            }
+
+            if ($path === null) {
+                return;
+            }
+
             if (LaporanKerusakan::where('foto', $path)->exists()) {
                 return;
             }
